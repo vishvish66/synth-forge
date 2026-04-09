@@ -1,0 +1,24 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment files
+.env
+frontend/.env.local
+
+# Node / Next
+frontend/node_modules/
+frontend/.next/
+
+# Graph cache
+.code-review-graph/
+
+# IDE / OS
+.vscode/
+.idea/
+*.log

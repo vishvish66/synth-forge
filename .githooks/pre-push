@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[pre-push] Running backend tests"
+./.venv/Scripts/python -m pytest -q
+
+echo "[pre-push] Running frontend build check"
+cd frontend
+npm run build >/dev/null
+
+echo "[pre-push] All checks passed"

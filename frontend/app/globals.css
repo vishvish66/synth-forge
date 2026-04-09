@@ -1,0 +1,50 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #090c12;
+  --surface: #111826;
+  --surface-2: #152033;
+  --line: #25354e;
+  --text: #e7ecf8;
+  --muted: #99aac8;
+  --accent: #33d0ff;
+  --accent-2: #2af598;
+}
+
+html,
+body {
+  background:
+    radial-gradient(1000px 600px at 90% -20%, rgb(20 90 130 / 0.4), transparent 60%),
+    radial-gradient(800px 500px at 10% 0%, rgb(40 80 150 / 0.35), transparent 55%),
+    var(--bg);
+  color: var(--text);
+  min-height: 100%;
+}
+
+* {
+  border-color: var(--line);
+}
+
+.container-x {
+  @apply mx-auto max-w-7xl px-4 sm:px-6 lg:px-8;
+}
+
+.glass {
+  background: linear-gradient(180deg, rgb(17 24 38 / 0.9), rgb(11 16 28 / 0.9));
+  border: 1px solid var(--line);
+  backdrop-filter: blur(10px);
+}
+
+.neon-ring {
+  box-shadow:
+    0 0 0 1px rgb(51 208 255 / 0.35) inset,
+    0 0 40px rgb(51 208 255 / 0.08);
+}
+
+.section-title {
+  @apply text-3xl font-semibold tracking-tight sm:text-4xl;
+}
+
+.section-copy {
+  color: var(--muted);
+}
