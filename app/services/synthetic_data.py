@@ -45,7 +45,7 @@ def generate_synthetic_data(
     np.random.seed(seed)
 
     profile = get_schema_profile(parsed_schema)
-    strategy = _pick_generation_strategy(profile)
+    strategy = _pick_generation_strategy(profile, row_count)
     corr_plan = _build_correlation_plan(parsed_schema, prompt)
 
     ordered_tables = _topological_table_order(parsed_schema.tables)
@@ -81,8 +81,10 @@ def generate_synthetic_data(
     )
 
 
-def _pick_generation_strategy(profile: dict[str, Any]) -> str:
+def _pick_generation_strategy(profile: dict[str, Any], row_count: int) -> str:
     cols = int(profile["total_columns"])
+    if cols > 200 or row_count > 100_000:
+        return "batched_large"
     if cols < 50:
         return "vectorized_small"
     if cols < 200:
@@ -138,12 +140,12 @@ def _generate_table_batch(
             continue
         parent_col = fk.ref_column if fk.ref_column in parent.columns else parent.columns[0]
         sampled_idx = np.random.randint(0, len(parent), size=n)
-        sampled_parent = parent.iloc[sampled_idx].reset_index(drop=True)
-        sampled = sampled_parent[parent_col].to_numpy()
+        # numpy indexer is much faster than repeated DataFrame row sampling on large tables.
+        sampled = parent[parent_col].to_numpy()[sampled_idx]
         data[fk.column] = sampled
         # Parent feature context for FK-driven cross-table correlations.
-        for c in sampled_parent.columns:
-            parent_context[f"{fk.ref_table}__{c}"] = sampled_parent[c]
+        for c in parent.columns:
+            parent_context[f"{fk.ref_table}__{c}"] = parent[c].to_numpy()[sampled_idx]
 
     # 3) Remaining columns (vectorized by type/name)
     for field in table.fields:
@@ -180,10 +182,19 @@ def _generate_field_series(field: FieldSpec, n: int, fake: Faker) -> pd.Series:
     if field.type == "integer":
         low = int(field.min_value if field.min_value is not None else 0)
         high = int(field.max_value if field.max_value is not None else 10000)
+        if "count" in name or "qty" in name or "quantity" in name:
+            lam = max(2.0, min(20.0, (high - low) / 6 if high > low else 3.0))
+            vals = np.random.poisson(lam=lam, size=n) + low
+            return pd.Series(np.clip(vals, low, max(low + 1, high)))
         return pd.Series(np.random.randint(low, max(low + 1, high + 1), size=n))
     if field.type == "float":
         low = float(field.min_value if field.min_value is not None else 0.0)
         high = float(field.max_value if field.max_value is not None else 1000.0)
+        if any(k in name for k in ["score", "probability", "rate", "ratio"]):
+            vals = np.random.beta(a=2.2, b=3.6, size=n)
+            if high > low:
+                vals = low + vals * (high - low)
+            return pd.Series(np.round(vals, 4))
         if "amount" in name or "price" in name or "cost" in name or "value" in name:
             sigma = 0.85
             scale = max((high - low) / 4 if high > low else 1.0, 1.0)
@@ -196,9 +207,21 @@ def _generate_field_series(field: FieldSpec, n: int, fake: Faker) -> pd.Series:
         p = 0.18 if "fraud" in name or "risk" in name or "abnormal" in name else 0.5
         return pd.Series((np.random.rand(n) < p).astype(bool))
     if field.type == "date":
-        return pd.Series([date.today() - timedelta(days=int(np.random.randint(0, 365 * 2))) for _ in range(n)])
+        base = np.array([date.today() - timedelta(days=int(np.random.randint(0, 365 * 2))) for _ in range(n)], dtype=object)
+        if any(k in name for k in ["created", "start", "signup", "opened"]):
+            base = np.sort(base)
+        return pd.Series(base)
     if field.type == "datetime":
-        return pd.Series([datetime.utcnow() - timedelta(hours=int(np.random.randint(0, 24 * 365))) for _ in range(n)])
+        base = np.array([datetime.utcnow() - timedelta(hours=int(np.random.randint(0, 24 * 365))) for _ in range(n)], dtype=object)
+        if any(k in name for k in ["created", "event", "timestamp", "occurred", "updated"]):
+            base = np.sort(base)
+        return pd.Series(base)
+    if "status" in name:
+        return pd.Series(np.random.choice(_status_values_for_column(name), size=n))
+    if "country" in name:
+        return pd.Series([fake.country() for _ in range(n)])
+    if "city" in name:
+        return pd.Series([fake.city() for _ in range(n)])
     return pd.Series([fake.word() for _ in range(n)])
 
 
@@ -234,6 +257,8 @@ def _build_correlation_plan(parsed_schema: ParsedSchema, prompt: str) -> dict[st
     risk_tokens = ("risk", "fraud", "readmission", "probability", "score")
     flag_tokens = ("flag", "is_", "has_", "status")
 
+    prompt_rules = _prompt_correlation_hints(prompt_lower)
+
     for table in parsed_schema.tables:
         fields = table.fields
         name_to_field = {f.name: f for f in fields}
@@ -264,7 +289,7 @@ def _build_correlation_plan(parsed_schema: ParsedSchema, prompt: str) -> dict[st
                     continue
                 rules.append(CorrelationRule(b.name, t.name, "positive", 0.22, "bool_num"))
 
-        # Prompt-directed heuristic: detect "X higher Y" pattern.
+        # Prompt-directed heuristic: detect "X higher Y" and "X more likely Y".
         for source in name_to_field:
             for target in name_to_field:
                 if source == target:
@@ -272,6 +297,22 @@ def _build_correlation_plan(parsed_schema: ParsedSchema, prompt: str) -> dict[st
                 pattern = f"{source.lower()} higher {target.lower()}"
                 if pattern in prompt_lower and name_to_field[source].type in {"integer", "float"} and name_to_field[target].type in {"integer", "float"}:
                     rules.append(CorrelationRule(source, target, "positive", 0.50, "num_num"))
+                pattern2 = f"{source.lower()} more likely {target.lower()}"
+                if pattern2 in prompt_lower and name_to_field[source].type in {"integer", "float"} and name_to_field[target].type == "boolean":
+                    rules.append(CorrelationRule(source, target, "positive", 0.42, "num_bool"))
+
+        # Prompt-wide semantic hints (high-value orders, premium customers, etc.)
+        for pr in prompt_rules:
+            if pr.source in name_to_field and pr.target in name_to_field:
+                rules.append(
+                    CorrelationRule(
+                        source=pr.source,
+                        target=pr.target,
+                        direction=pr.direction,
+                        strength=pr.strength,
+                        kind=pr.kind,
+                    )
+                )
 
         # Keep plan compact for very wide schemas.
         table_rules[table.name] = rules[:120]
@@ -309,6 +350,7 @@ def _apply_correlation_rules(df: pd.DataFrame, table: TableSpec, rules: list[Cor
             logits = (src_norm * (2.2 * r.strength)).clip(-4, 4)
             probs = 1.0 / (1.0 + np.exp(-logits))
             df[r.target] = (np.random.rand(len(df)) < probs).astype(bool)
+    df = _enforce_timestamp_sequence(df)
     return df
 
 
@@ -451,6 +493,51 @@ def _realistic_zip(fake: Faker) -> str:
     if len(digits) < 5:
         digits = f"{np.random.randint(0, 100000):05d}"
     return digits[:5]
+
+
+def _status_values_for_column(name: str) -> list[str]:
+    if "order" in name:
+        return ["created", "paid", "packed", "shipped", "delivered", "cancelled"]
+    if "payment" in name:
+        return ["initiated", "authorized", "captured", "failed", "refunded"]
+    if "ticket" in name or "case" in name:
+        return ["open", "pending", "resolved", "closed"]
+    if "shipment" in name:
+        return ["label_created", "in_transit", "out_for_delivery", "delivered", "returned"]
+    return ["active", "inactive", "pending", "failed"]
+
+
+def _prompt_correlation_hints(prompt_lower: str) -> list[CorrelationRule]:
+    hints: list[CorrelationRule] = []
+    if "high-value orders more likely to be from premium customers" in prompt_lower:
+        hints.append(CorrelationRule("total_amount", "is_premium", "positive", 0.55, "num_bool"))
+        hints.append(CorrelationRule("loyalty_tier", "total_amount", "positive", 0.45, "num_num"))
+    if "older customers have higher order value" in prompt_lower:
+        hints.append(CorrelationRule("age", "order_value", "positive", 0.50, "num_num"))
+    if "fraud" in prompt_lower and "amount" in prompt_lower:
+        hints.append(CorrelationRule("amount", "fraud_flag", "positive", 0.45, "num_bool"))
+    return hints
+
+
+def _enforce_timestamp_sequence(df: pd.DataFrame) -> pd.DataFrame:
+    date_cols = [c for c in df.columns if any(k in c.lower() for k in ["date", "time", "timestamp"])]
+    if len(date_cols) < 2:
+        return df
+    # If both created/start and updated/end exist, enforce monotonic relationship row-wise.
+    start_candidates = [c for c in date_cols if any(k in c.lower() for k in ["created", "start", "signup", "order_date"])]
+    end_candidates = [c for c in date_cols if any(k in c.lower() for k in ["updated", "end", "closed", "delivery", "payment_date"])]
+    if not start_candidates or not end_candidates:
+        return df
+    s_col = start_candidates[0]
+    e_col = end_candidates[0]
+    s = pd.to_datetime(df[s_col], errors="coerce")
+    e = pd.to_datetime(df[e_col], errors="coerce")
+    mask = (e < s) & s.notna() & e.notna()
+    if mask.any():
+        delta = pd.to_timedelta(np.random.randint(1, 96, size=mask.sum()), unit="h")
+        e.loc[mask] = s.loc[mask] + delta
+        df[e_col] = e
+    return df
 
 
 def _topological_table_order(tables: list[TableSpec]) -> list[TableSpec]:
