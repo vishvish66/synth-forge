@@ -126,6 +126,7 @@ def _generate_table_batch(
 ) -> pd.DataFrame:
     n = row_count
     data: dict[str, Any] = {}
+    parent_context: dict[str, pd.Series] = {}
 
     # 1) Primary key
     data[table.primary_key] = np.arange(1 + pk_offset, n + 1 + pk_offset, dtype=int)
@@ -136,8 +137,13 @@ def _generate_table_batch(
         if parent is None or len(parent) == 0:
             continue
         parent_col = fk.ref_column if fk.ref_column in parent.columns else parent.columns[0]
-        sampled = np.random.choice(parent[parent_col].to_numpy(), size=n, replace=True)
+        sampled_idx = np.random.randint(0, len(parent), size=n)
+        sampled_parent = parent.iloc[sampled_idx].reset_index(drop=True)
+        sampled = sampled_parent[parent_col].to_numpy()
         data[fk.column] = sampled
+        # Parent feature context for FK-driven cross-table correlations.
+        for c in sampled_parent.columns:
+            parent_context[f"{fk.ref_table}__{c}"] = sampled_parent[c]
 
     # 3) Remaining columns (vectorized by type/name)
     for field in table.fields:
@@ -147,6 +153,7 @@ def _generate_table_batch(
         data[field.name] = _generate_field_series(field, n, fake).to_numpy()
 
     df = pd.DataFrame(data, columns=[f.name for f in table.fields])
+    df = _apply_parent_influence(df, table, parent_context)
     df = _apply_correlation_rules(df, table, rules)
     return df
 
@@ -313,11 +320,71 @@ def _normalize_numeric(series: pd.Series) -> pd.Series:
     return (s - s.mean()) / std
 
 
+def _apply_parent_influence(df: pd.DataFrame, table: TableSpec, parent_context: dict[str, pd.Series]) -> pd.DataFrame:
+    if not parent_context:
+        return df
+    cols = {f.name: f for f in table.fields}
+
+    # Look for typical driver columns from parent rows.
+    parent_age = _first_context_series(parent_context, suffix="__age")
+    parent_tenure = _first_context_series(parent_context, suffix="__tenure")
+    parent_comorb = _first_context_series(parent_context, suffix="__comorbidity_count")
+    parent_driver = parent_age if parent_age is not None else parent_tenure
+
+    if parent_driver is not None:
+        d = _normalize_numeric(parent_driver)
+        for target in df.columns:
+            t = target.lower()
+            field = cols.get(target)
+            if field is None:
+                continue
+            if field.type in {"integer", "float"} and any(k in t for k in ["amount", "price", "cost", "value", "duration", "length_of_stay", "risk", "score"]):
+                base = pd.to_numeric(df[target], errors="coerce").fillna(0.0)
+                adjusted = base + (0.28 * d * (base.std() if base.std() > 0 else 1.0))
+                df[target] = _apply_constraints_series(field, adjusted)
+            if field.type == "boolean" and any(k in t for k in ["risk", "fraud", "abnormal", "flag"]):
+                probs = (0.5 + 0.20 * d).clip(0.05, 0.95)
+                df[target] = (np.random.rand(len(df)) < probs).astype(bool)
+
+    if parent_comorb is not None:
+        c = _normalize_numeric(parent_comorb)
+        for target in df.columns:
+            t = target.lower()
+            field = cols.get(target)
+            if field is None:
+                continue
+            if field.type in {"integer", "float"} and any(k in t for k in ["risk", "score", "cost", "length_of_stay"]):
+                base = pd.to_numeric(df[target], errors="coerce").fillna(0.0)
+                adjusted = base + (0.24 * c * (base.std() if base.std() > 0 else 1.0))
+                df[target] = _apply_constraints_series(field, adjusted)
+    return df
+
+
+def _first_context_series(context: dict[str, pd.Series], suffix: str) -> pd.Series | None:
+    for k, v in context.items():
+        if k.endswith(suffix):
+            return pd.to_numeric(v, errors="coerce").fillna(0.0)
+    return None
+
+
 def compute_validation_metrics(
     tables: dict[str, pd.DataFrame],
     parsed_schema_or_domain: ParsedSchema | str,
 ) -> dict[str, Any]:
     if isinstance(parsed_schema_or_domain, str):
+        domain = parsed_schema_or_domain
+        # Backward-compatible mode for existing callers/tests.
+        if domain == "healthcare" and "patients" in tables and "claims" in tables:
+            patients = tables["patients"]
+            claims = tables["claims"]
+            if not patients.empty and not claims.empty and "patient_id" in claims.columns and "id" in patients.columns:
+                merged = claims.merge(patients, left_on="patient_id", right_on="id", how="inner")
+                corr_cols = [
+                    c for c in ["age", "cost", "length_of_stay", "comorbidity_count", "readmission_risk_score"]
+                    if c in merged.columns
+                ]
+                corr = merged[corr_cols].corr(numeric_only=True).round(4).to_dict() if len(corr_cols) >= 2 else {}
+                return {"correlation_matrix": corr, "joined_row_count": int(len(merged))}
         parsed_schema = ParsedSchema(tables=[], relationships={})
     else:
         parsed_schema = parsed_schema_or_domain
