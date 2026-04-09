@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from app.core.config import Settings
-from app.models.schema import ParsedSchema
+from app.models.schema import ParsedSchema, TableSpec
 
 
 def generate_pyspark_pipeline_code(parsed_schema: ParsedSchema, domain: str, settings: Settings) -> str:
+    del domain
     table_names = [t.name for t in parsed_schema.tables]
     table_list_literal = ", ".join([f'"{name}"' for name in table_names])
-    patients_table = "patients" if "patients" in table_names else ""
-    claims_table = "claims" if "claims" in table_names else ("encounters" if "encounters" in table_names else "")
+    fk_edges = [(t.name, fk.column, fk.ref_table, fk.ref_column) for t in parsed_schema.tables for fk in t.foreign_keys]
+
+    partition_map = {t.name: _infer_partition_column(t) for t in parsed_schema.tables}
+    numeric_map = {t.name: _numeric_columns(t) for t in parsed_schema.tables}
+    dim_map = {t.name: _dimension_columns(t) for t in parsed_schema.tables}
 
     return f'''from pyspark.sql import SparkSession, functions as F
 
@@ -21,27 +25,31 @@ SILVER_PATH = "{settings.delta_silver_path}"
 GOLD_PATH = "{settings.delta_gold_path}"
 TABLES = [{table_list_literal}]
 
-# Cost estimate hint:
-# - Small cluster (2-4 workers): suitable for <= 1M rows
-# - Medium cluster (4-8 workers): recommended for multi-million rows and wider schemas
+PARTITION_MAP = {partition_map}
+NUMERIC_MAP = {numeric_map}
+DIM_MAP = {dim_map}
+FK_EDGES = {fk_edges}
 
 spark.sql(f"CREATE CATALOG IF NOT EXISTS {{CATALOG}}")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {{CATALOG}}.{{SCHEMA}}")
 
 def write_bronze(table_name: str):
-    # Reads generated files and writes immutable bronze snapshots.
     df = (
         spark.read
         .option("header", True)
         .option("inferSchema", True)
         .csv(f"/dbfs/tmp/synthforge/{{table_name}}/*.csv")
     )
-    (
+    writer = (
         df.withColumn("_ingest_ts", F.current_timestamp())
           .write.mode("overwrite")
           .format("delta")
-          .save(f"{{BRONZE_PATH}}/{{table_name}}")
     )
+    pcol = PARTITION_MAP.get(table_name)
+    if pcol and pcol in df.columns:
+        writer = writer.partitionBy(pcol)
+    writer.save(f"{{BRONZE_PATH}}/{{table_name}}")
+
     spark.sql(
         f"CREATE TABLE IF NOT EXISTS {{CATALOG}}.{{SCHEMA}}.brz_{{table_name}} "
         f"USING DELTA LOCATION '{{BRONZE_PATH}}/{{table_name}}'"
@@ -50,112 +58,98 @@ def write_bronze(table_name: str):
 def write_silver(table_name: str):
     bronze_df = spark.read.format("delta").load(f"{{BRONZE_PATH}}/{{table_name}}")
     cleaned_df = bronze_df.dropDuplicates()
-    (
+    writer = (
         cleaned_df.write.mode("overwrite")
         .option("overwriteSchema", "true")
         .format("delta")
-        .save(f"{{SILVER_PATH}}/{{table_name}}")
     )
+    pcol = PARTITION_MAP.get(table_name)
+    if pcol and pcol in cleaned_df.columns:
+        writer = writer.partitionBy(pcol)
+    writer.save(f"{{SILVER_PATH}}/{{table_name}}")
+
     spark.sql(
         f"CREATE TABLE IF NOT EXISTS {{CATALOG}}.{{SCHEMA}}.slv_{{table_name}} "
         f"USING DELTA LOCATION '{{SILVER_PATH}}/{{table_name}}'"
     )
 
+def build_generic_gold():
+    # 1) Per-table aggregate gold
+    for t in TABLES:
+        df = spark.read.format("delta").load(f"{{SILVER_PATH}}/{{t}}")
+        dims = [c for c in DIM_MAP.get(t, []) if c in df.columns][:2]
+        nums = [c for c in NUMERIC_MAP.get(t, []) if c in df.columns][:4]
+        if not nums:
+            continue
+        aggs = [F.avg(F.col(c)).alias(f"avg_{{c}}") for c in nums] + [F.count("*").alias("row_count")]
+        if dims:
+            gold_df = df.groupBy(*dims).agg(*aggs)
+        else:
+            gold_df = df.agg(*aggs)
+        out_path = f"{{GOLD_PATH}}/gld_{{t}}_summary"
+        gold_df.write.mode("overwrite").format("delta").save(out_path)
+        spark.sql(
+            f"CREATE TABLE IF NOT EXISTS {{CATALOG}}.{{SCHEMA}}.gld_{{t}}_summary "
+            f"USING DELTA LOCATION '{{out_path}}'"
+        )
+
+    # 2) FK-join gold (child-parent)
+    for child_table, fk_col, parent_table, parent_col in FK_EDGES:
+        if child_table not in TABLES or parent_table not in TABLES:
+            continue
+        cdf = spark.read.format("delta").load(f"{{SILVER_PATH}}/{{child_table}}")
+        pdf = spark.read.format("delta").load(f"{{SILVER_PATH}}/{{parent_table}}")
+        if fk_col not in cdf.columns or parent_col not in pdf.columns:
+            continue
+        joined = cdf.join(pdf, cdf[fk_col] == pdf[parent_col], "inner")
+        numeric = [c for c in (NUMERIC_MAP.get(child_table, []) + NUMERIC_MAP.get(parent_table, [])) if c in joined.columns][:4]
+        if not numeric:
+            continue
+        dims = [c for c in DIM_MAP.get(child_table, []) if c in joined.columns][:1]
+        aggs = [F.avg(F.col(c)).alias(f"avg_{{c}}") for c in numeric] + [F.count("*").alias("row_count")]
+        gdf = joined.groupBy(*dims).agg(*aggs) if dims else joined.agg(*aggs)
+        out_path = f"{{GOLD_PATH}}/gld_{{child_table}}_{{parent_table}}_joined"
+        gdf.write.mode("overwrite").format("delta").save(out_path)
+        spark.sql(
+            f"CREATE TABLE IF NOT EXISTS {{CATALOG}}.{{SCHEMA}}.gld_{{child_table}}_{{parent_table}}_joined "
+            f"USING DELTA LOCATION '{{out_path}}'"
+        )
+
 for t in TABLES:
     write_bronze(t)
     write_silver(t)
 
-def write_gold_healthcare():
-    pt = spark.read.format("delta").load(f"{{SILVER_PATH}}/{patients_table}")
-    cl = spark.read.format("delta").load(f"{{SILVER_PATH}}/{claims_table}")
+build_generic_gold()
 
-    patient_key = "id" if "id" in pt.columns else pt.columns[0]
-    claim_fk = "patient_id" if "patient_id" in cl.columns else patient_key
-
-    claims_enriched = (
-        cl.join(pt, cl[claim_fk] == pt[patient_key], "inner")
-          .withColumn(
-              "age_group",
-              F.when(F.col("age") < 40, F.lit("18-39"))
-               .when(F.col("age") < 60, F.lit("40-59"))
-               .otherwise(F.lit("60+"))
-          )
-          .withColumn("cost_per_day", F.col("cost") / F.greatest(F.col("length_of_stay"), F.lit(1)))
-    )
-
-    # Silver curated joined table for downstream use.
-    (
-        claims_enriched.write.mode("overwrite")
-        .format("delta")
-        .partitionBy("service_date")
-        .save(f"{{SILVER_PATH}}/claims_enriched")
-    )
-    spark.sql(
-        f"CREATE TABLE IF NOT EXISTS {{CATALOG}}.{{SCHEMA}}.slv_claims_enriched "
-        f"USING DELTA LOCATION '{{SILVER_PATH}}/claims_enriched'"
-    )
-
-    gold_by_age_diag = (
-        claims_enriched.groupBy("age_group", "diagnosis_code")
-        .agg(
-            F.count("*").alias("claim_count"),
-            F.avg("cost").alias("avg_cost"),
-            F.avg("cost_per_day").alias("avg_cost_per_day"),
-            F.avg("readmission_risk_score").alias("avg_readmission_risk")
-        )
-    )
-    (
-        gold_by_age_diag.write.mode("overwrite")
-        .format("delta")
-        .partitionBy("age_group")
-        .save(f"{{GOLD_PATH}}/gld_cost_by_age_diagnosis")
-    )
-    spark.sql(
-        f"CREATE TABLE IF NOT EXISTS {{CATALOG}}.{{SCHEMA}}.gld_cost_by_age_diagnosis "
-        f"USING DELTA LOCATION '{{GOLD_PATH}}/gld_cost_by_age_diagnosis'"
-    )
-
-    gold_comorbidity = (
-        claims_enriched.groupBy("comorbidity_count")
-        .agg(
-            F.count("*").alias("claim_count"),
-            F.avg("length_of_stay").alias("avg_length_of_stay"),
-            F.avg("cost").alias("avg_cost"),
-            F.avg("readmission_risk_score").alias("avg_readmission_risk")
-        )
-    )
-    (
-        gold_comorbidity.write.mode("overwrite")
-        .format("delta")
-        .save(f"{{GOLD_PATH}}/gld_comorbidity_impact")
-    )
-    spark.sql(
-        f"CREATE TABLE IF NOT EXISTS {{CATALOG}}.{{SCHEMA}}.gld_comorbidity_impact "
-        f"USING DELTA LOCATION '{{GOLD_PATH}}/gld_comorbidity_impact'"
-    )
-
-    # Databricks Delta maintenance best-practice.
-    spark.sql(f"OPTIMIZE {{CATALOG}}.{{SCHEMA}}.slv_claims_enriched ZORDER BY (patient_id, diagnosis_code)")
-    spark.sql(f"OPTIMIZE {{CATALOG}}.{{SCHEMA}}.gld_cost_by_age_diagnosis ZORDER BY (diagnosis_code)")
-
-def write_gold_credit():
-    tx = spark.read.format("delta").load(f"{{SILVER_PATH}}/transactions")
-    gold = tx.groupBy("is_fraud").agg(
-        F.count("*").alias("txn_count"),
-        F.avg("amount").alias("avg_amount")
-    )
-    gold.write.mode("overwrite").format("delta").save(f"{{GOLD_PATH}}/gld_fraud_summary")
-    spark.sql(
-        f"CREATE TABLE IF NOT EXISTS {{CATALOG}}.{{SCHEMA}}.gld_fraud_summary "
-        f"USING DELTA LOCATION '{{GOLD_PATH}}/gld_fraud_summary'"
-    )
-    spark.sql(f"OPTIMIZE {{CATALOG}}.{{SCHEMA}}.gld_fraud_summary")
-
-if "{domain}" == "healthcare" and "{patients_table}" in TABLES and "{claims_table}" in TABLES:
-    write_gold_healthcare()
-elif "{domain}" == "credit" and "transactions" in TABLES:
-    write_gold_credit()
+# Optional maintenance (safe no-op if not supported by workspace policy)
+for t in TABLES:
+    try:
+        spark.sql(f"OPTIMIZE {{CATALOG}}.{{SCHEMA}}.slv_{{t}}")
+    except Exception:
+        pass
 '''
+
+
+def _infer_partition_column(table: TableSpec) -> str | None:
+    for f in table.fields:
+        if f.type in {"date", "datetime"}:
+            return f.name
+    return None
+
+
+def _numeric_columns(table: TableSpec) -> list[str]:
+    return [f.name for f in table.fields if f.type in {"integer", "float"} and f.name != table.primary_key]
+
+
+def _dimension_columns(table: TableSpec) -> list[str]:
+    dims: list[str] = []
+    for f in table.fields:
+        n = f.name.lower()
+        if f.type == "string" and ("type" in n or "status" in n or "category" in n or "segment" in n):
+            dims.append(f.name)
+        if f.type == "boolean":
+            dims.append(f.name)
+    return dims[:3]
 
 
 def generate_kafka_templates(domain: str) -> dict[str, str]:

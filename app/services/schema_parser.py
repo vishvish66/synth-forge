@@ -61,6 +61,32 @@ def parse_schema(schema_json: dict[str, Any]) -> ParsedSchema:
     return ParsedSchema(tables=tables, relationships=relationships)
 
 
+def get_schema_profile(parsed_schema: ParsedSchema) -> dict[str, Any]:
+    total_tables = len(parsed_schema.tables)
+    total_columns = sum(len(t.fields) for t in parsed_schema.tables)
+    fk_count = sum(len(t.foreign_keys) for t in parsed_schema.tables)
+    date_columns = [
+        f"{t.name}.{f.name}"
+        for t in parsed_schema.tables
+        for f in t.fields
+        if f.type in {"date", "datetime"}
+    ]
+    pii_columns = [
+        f"{t.name}.{f.name}"
+        for t in parsed_schema.tables
+        for f in t.fields
+        if f.pii
+    ]
+    return {
+        "total_tables": total_tables,
+        "total_columns": total_columns,
+        "foreign_key_count": fk_count,
+        "date_columns": date_columns,
+        "pii_columns": pii_columns,
+        "size_tier": "small" if total_columns < 50 else ("medium" if total_columns < 200 else "large"),
+    }
+
+
 def _single_table_to_multi(schema_json: dict[str, Any]) -> dict[str, Any]:
     if "table_name" not in schema_json:
         raise SchemaParserError("Schema must contain either 'tables' or a single-table 'table_name'")
