@@ -402,10 +402,11 @@ def _apply_parent_influence(df: pd.DataFrame, table: TableSpec, parent_context: 
     return df
 
 
-def _first_context_series(context: dict[str, pd.Series], suffix: str) -> pd.Series | None:
+def _first_context_series(context: dict[str, Any], suffix: str) -> pd.Series | None:
     for k, v in context.items():
         if k.endswith(suffix):
-            return pd.to_numeric(v, errors="coerce").fillna(0.0)
+            series = pd.Series(v) if not isinstance(v, pd.Series) else v
+            return pd.to_numeric(series, errors="coerce").fillna(0.0)
     return None
 
 
